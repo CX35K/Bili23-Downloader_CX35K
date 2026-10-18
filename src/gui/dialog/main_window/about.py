@@ -102,7 +102,7 @@ class AboutDialog(DialogBase):
         webbrowser.open("https://bili23.scott-sloan.cn/doc/introduction.html")
 
     def on_github(self):
-        webbrowser.open("https://github.com/ScottSloan/Bili23-Downloader")
+        webbrowser.open("https://github.com/CX35K/Bili23-Downloader_CX35K")
 
     def on_sponsor(self):
         webbrowser.open("https://bili23.scott-sloan.cn/doc/about.html")

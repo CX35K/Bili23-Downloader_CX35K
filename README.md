@@ -3,9 +3,9 @@
 基于开源项目 **Bili23 Downloader**（GPLv3）的修改版，在保留原有功能的基础上新增了内置浏览器、
 M4A→FLAC 转换等能力，并按个人使用习惯做了一些调整。
 
-> 非官方版本，与原作者无关。原项目：<https://github.com/ScottSloan/Bili23-Downloader>
->
-> 关于页里的 GitHub 链接目前仍指向原项目，等本仓库地址确定后会替换。
+> 非官方版本，与原作者无关。
+> 原项目：<https://github.com/ScottSloan/Bili23-Downloader>
+> 本仓库：<https://github.com/CX35K/Bili23-Downloader_CX35K>
 >
 > 说明：内置浏览器等**新增功能**在开发过程中遇到过弹窗交互、页面叠层之类的适配问题，
 > 都已在本项目内部解决；这些属于新功能自身的实现细节，与原版软件无关，也不代表原版存在问题。
