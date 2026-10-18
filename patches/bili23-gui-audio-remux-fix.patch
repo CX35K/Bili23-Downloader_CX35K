@@ -1,0 +1,207 @@
+--- a/util/common/runtime.py
++++ b/util/common/runtime.py
+@@ -42,6 +42,11 @@
+ 
+         # 既没有内置也没有找到外部可执行文件
+         self.unavailable: bool = True
++
++        # 当前生效的 FFmpeg 支持哪些封装器（`-muxers` 的输出）。
++        # 内置的裁剪版没有 m4a(ipod) 与 eac3 两个封装器，重封装独立音频流时必须
++        # 依据它显式指定容器，不能只靠扩展名让 FFmpeg 自己猜（见 util/ffmpeg/command.py）
++        self.muxers: set = set()
+ 
+ 
+ class DownloadOptionsState:
+--- a/util/ffmpeg/__init__.py
++++ b/util/ffmpeg/__init__.py
+@@ -6,10 +6,15 @@
+ from pathlib import Path
+ import logging
+ import shutil
++import re
++import subprocess
+ import sys
+ import os
+ 
+ logger = logging.getLogger(__name__)
++
++# `ffmpeg -muxers` 的输出形如 "  E  mp4    MP4 (MPEG-4 Part 14)"
++_MUXER_PATTERN = re.compile(r"^\s*E\s+(\S+)")
+ 
+ # 确定不同平台 FFmpeg 可执行文件名
+ if sys.platform == "win32":
+@@ -107,3 +112,64 @@
+ 
+                 else:
+                     on_ffmpeg_not_found()
++
++    if not runtime.ffmpeg.unavailable:
++        runtime.ffmpeg.muxers = probe_supported_muxers()
++
++
++def probe_supported_muxers() -> set:
++    """
++    查询当前生效的 FFmpeg 支持哪些封装器
++
++    这一步是「独立音频流重封装」修复的前提：安装包内置的 FFmpeg 是裁剪版，
++    编译时只开了 mp4/flv/mp3/flac/matroska/mov，**没有 m4a(ipod) 与 eac3**。
++    而重封装原先只给输出文件名、让 FFmpeg 按扩展名猜容器，遇到 .m4a/.ec3 时
++    直接报 "Unable to choose an output format" / "Error initializing the muxer"，
++    表现就是下载独立音频流必失败。拿到封装器清单后即可显式 -f 并做降级判断。
++
++    探测失败（老版本 FFmpeg 不支持 -muxers、进程被拦等）返回空集合，调用方据此
++    退回旧的「按扩展名猜容器」行为，不会比修复前更差。
++    """
++    try:
++        kwargs = {}
++
++        if os.name == "nt":
++            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
++
++        result = subprocess.run(
++            [ffmpeg_executable, "-hide_banner", "-muxers"],
++            stdout = subprocess.PIPE,
++            stderr = subprocess.DEVNULL,
++            text = True,
++            encoding = "utf-8",
++            errors = "replace",
++            timeout = 15,
++            **kwargs
++        )
++
++    except (OSError, subprocess.SubprocessError):
++        logger.warning("探测 FFmpeg 封装器失败，将退回按扩展名推断容器", exc_info = True)
++
++        return set()
++
++    muxers = {
++        match.group(1)
++        for line in result.stdout.splitlines()
++        if (match := _MUXER_PATTERN.match(line))
++    }
++
++    logger.info("FFmpeg 支持的封装器：%s", ", ".join(sorted(muxers)))
++
++    return muxers
++
++
++def supports_muxer(name: str) -> bool:
++    """判断当前 FFmpeg 是否有指定封装器；探测不到时按支持处理，交给 FFmpeg 自己报错"""
++    if not runtime.ffmpeg.muxers:
++        runtime.ffmpeg.muxers = probe_supported_muxers()
++
++    if not runtime.ffmpeg.muxers:
++        return True
++
++    return name in runtime.ffmpeg.muxers
++
+--- a/util/ffmpeg/command.py
++++ b/util/ffmpeg/command.py
+@@ -161,7 +161,7 @@
+         )
+     
+     @classmethod
+-    def remux_audio(cls, input_path: str, output_path: str):
++    def remux_audio(cls, input_path: str, output_path: str, output_format: str = None, faststart: bool = False):
+         # 把独立音频流重新封装进标准容器
+         #
+         # B 站的 DASH 独立音频流是 fMP4 **分片**容器：ftyp + moov（不含采样表）+
+@@ -171,13 +171,30 @@
+         # 都是向播放器承诺「标准容器」的，只改扩展名交付等于递了个假承诺
+         #
+         # -c copy 只重写容器、不重编码，27 分钟音轨实测约 0.19 秒
+-        # -movflags +faststart 把 moov 前置；非 mov 系容器（flac、ec3）下 FFmpeg 会静默
+-        # 忽略它，因此三种扩展名可以共用同一条命令，无需按扩展名分支
+-        return (
++        #
++        # 容器必须由调用方显式给出（output_format），不能指望扩展名推断：
++        # 内置 FFmpeg 是裁剪编译的，只开了 mp4/flv/mp3/flac/matroska/mov，没有
++        # ipod(m4a) 与 eac3 流式封装器，输出名取 .m4a/.ec3 时 FFmpeg 会直接报
++        # "Unable to choose an output format for ..." 然后 "Error initializing the
++        # muxer ... Invalid argument" —— 这就是「下载独立音频流必失败」的根因。
++        #
++        # -movflags / -strict unofficial 只对 mov 系容器有意义：flac、eac3 这类
++        # 裸容器带上它们要么被忽略，要么在严格解析时报警，因此只在 mp4 下加
++        command = (
+             cls()
+             .add_input(input_path)
+             .add_param("-c", "copy")
+-            .add_param("-movflags", "+faststart")
+-            .allow_unofficial()
+-            .add_output(output_path)
+-        )+        )
++
++        if faststart:
++            command.add_param("-movflags", "+faststart")
++
++        if output_format == "mp4":
++            # 杜比视界配置记录（dvcC/dvvC）需要非标准级别才写得进去，音频封装下
++            # 虽用不到，但保持与其它封装流程一致，避免将来换成整轨拷贝时踩坑
++            command.allow_unofficial()
++
++        if output_format:
++            command.add_param("-f", output_format)
++
++        return command.add_output(output_path)
+--- a/util/download/downloader/merger.py
++++ b/util/download/downloader/merger.py
+@@ -11,6 +11,7 @@
+ 
+ from ...ffmpeg.command import FFmpegCommand
+ from ...ffmpeg.runner import FFmpegRunner
++from ...ffmpeg import supports_muxer
+ 
+ from ..task.manager import task_manager
+ from ..task.info import TaskInfo
+@@ -25,6 +26,23 @@
+ # 重封装成与扩展名一致的标准容器，否则严格解析器打不开。
+ # 用它当判据而不是逐个判断扩展名，是为了让三种格式始终走同一条命令
+ DASH_AUDIO_STREAM_EXTS = ("m4a", "flac", "ec3")
++
++# 重封装的独立音频流要写进哪种容器：(容器格式, 是否把 moov 前置)
++#
++# 不能让 FFmpeg 按扩展名推断：安装包内置的是裁剪编译的 FFmpeg，只开了
++# mp4/flv/mp3/flac/matroska/mov，没有 ipod（.m4a）与 eac3（.ec3）封装器，
++# 输出名取 .m4a/.ec3 时它会先报 "Unable to choose an output format"、
++# 再报 "Error initializing the muxer ... Invalid argument"。表现就是
++# 「下载独立音频流必失败」。m4a 用 mp4 容器（同一族，等价且更通用）。
++DASH_AUDIO_CONTAINER_FORMATS = {
++    "m4a": ("mp4", True),
++    "flac": ("flac", False),
++    "ec3": ("eac3", False),
++}
++
++# eac3 封装器缺失时的降级容器：E-AC-3 在 MP4 里是合法流，
++# 交付扩展名随之改成 .m4a，避免"扩展名承诺一种容器、内容却是另一种"
++DASH_AUDIO_FALLBACK_CONTAINER = ("mp4", True, "m4a")
+ 
+ # stop() 超时后从 parent 链上摘下来的 Merger 暂存于此，保活到 FFmpeg 线程真正结束。
+ # 不保活的话，Python 侧最后一个引用消失就会析构，而 C++ 端的 QThread 还在跑
+@@ -534,11 +552,26 @@
+         self.task_info.Download.status = DownloadStatus.CONVERTING
+         signal_bus.download.update_downloading_item.emit(self.task_info)
+ 
++        audio_file_ext = self.task_info.File.audio_file_ext
++
++        output_format, faststart = DASH_AUDIO_CONTAINER_FORMATS.get(audio_file_ext, (None, False))
++
++        # 内置 FFmpeg 没有 eac3 封装器（杜比全景声的 .ec3 流）时不能硬写裸容器：
++        # 退到 mp4 并把交付扩展名一起改成 .m4a，文件名与内容保持一致
++        if output_format == "eac3" and not supports_muxer("eac3"):
++            logger.warning("当前 FFmpeg 不支持 eac3 封装器，%s 音频将改用 mp4 容器交付", audio_file_ext)
++
++            output_format, faststart, fallback_ext = DASH_AUDIO_FALLBACK_CONTAINER
++
++            self._converted_audio_file_ext = fallback_ext
++
+         self._output_audio_file = self.temp_remux_audio_file_name
+ 
+         remux_cmd = FFmpegCommand.remux_audio(
+             input_path = self.temp_audio_file_name,
+-            output_path = self.temp_remux_audio_file_name
++            output_path = self.temp_remux_audio_file_name,
++            output_format = output_format,
++            faststart = faststart
+         )
+ 
+         self._start_ffmpeg(remux_cmd, cwd, on_finished)

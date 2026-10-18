@@ -1,0 +1,195 @@
+--- a/util/common/config.py
++++ b/util/common/config.py
+@@ -371,6 +371,8 @@
+ 
+     video_container = OptionsConfigItem("Download", "video_container", VideoContainer.MP4, OptionsValidator(VideoContainer), EnumSerializer(VideoContainer))
+     m4a_to_mp3 = ConfigItem("Download", "m4a_to_mp3", False)
++    # 下载独立音频流（仅音频任务）时把 M4A 转成 FLAC。与 m4a_to_mp3 同时开启时以 FLAC 为准
++    m4a_to_flac = ConfigItem("Download", "m4a_to_flac", False)
+ 
+     # 下载哪几路流、下完之后怎么处理。
+     #
+--- a/util/common/translator.py
++++ b/util/common/translator.py
+@@ -4,6 +4,30 @@
+ 
+ # alias
+ translate = QCoreApplication.translate
++
++def localize(simplified: str, traditional: str, english: str) -> str:
++    """
++    按当前界面语言直接取一段文案
++
++    UI 文案平时走 Qt 的 .qm 翻译（编译进 res/resources_rc.py），改不了资源就没法
++    给新字符串补翻译，因此新加的界面文字用这里按语言现取：AUTO 时跟随系统
++    locale，其余情况跟 main.py 加载翻译时用的是同一份 config.language。
++    """
++    from .config import config
++
++    try:
++        name = config.get(config.language).value.name()
++
++    except Exception:    # noqa: BLE001  配置尚未初始化时退回英文，不能因为一句文案崩界面
++        return english
++
++    if name.startswith("zh_TW") or "Hant" in name:
++        return traditional
++
++    if name.startswith("zh"):
++        return simplified
++
++    return english
+ 
+ def get_map_method(func):
+     @wraps(func)
+--- a/util/download/task/info.py
++++ b/util/download/task/info.py
+@@ -172,6 +172,7 @@
+     metadata_type: str = None
+ 
+     m4a_to_mp3: bool = None
++    m4a_to_flac: bool = None
+ 
+     keep_original_files_type: int = None
+ 
+--- a/util/download/task/options.py
++++ b/util/download/task/options.py
+@@ -32,6 +32,7 @@
+     "metadata_type": MetadataType,
+ 
+     "m4a_to_mp3": None,
++    "m4a_to_flac": None,
+ 
+     # 保留原始文件时保留哪一路流。它的两个同伴 merge_video_audio 与
+     # keep_original_files 早就固化在 DownloadInfo 里了，唯独它一直是在合并阶段
+--- a/util/ffmpeg/command.py
++++ b/util/ffmpeg/command.py
+@@ -159,6 +159,24 @@
+             .add_param("-q:a", "2")
+             .add_output(output_path)
+         )
++
++    @classmethod
++    def convert_m4a_to_flac(cls, input_path: str, output_path: str):
++        # 解码 AAC 后编码成 FLAC（内置 FFmpeg 的 flac 编码器是原生实现，
++        # 没有 libFLAC 也照样可用）。源本来就是有损 AAC，转 FLAC 只是换了个
++        # 无损容器/编码，不会提升音质，但兼容性与后续编辑更省事
++        #
++        # 显式 -f flac：与 remux_audio 同样的原因，不依赖扩展名推断容器
++        # -compression_level 8 是 0~12 档里性价比最高的一档（再往上编码时间
++        # 明显变长、体积收益很小），单曲转换仍在秒级
++        return (
++            cls()
++            .add_input(input_path)
++            .add_param("-c:a", "flac")
++            .add_param("-compression_level", "8")
++            .add_param("-f", "flac")
++            .add_output(output_path)
++        )
+     
+     @classmethod
+     def remux_audio(cls, input_path: str, output_path: str, output_format: str = None, faststart: bool = False):
+--- a/util/download/downloader/merger.py
++++ b/util/download/downloader/merger.py
+@@ -162,10 +162,16 @@
+             self.merge_video_parts()
+ 
+         elif self.task_info.File.audio_file_ext in DASH_AUDIO_STREAM_EXTS:
+-            if self.task_info.File.audio_file_ext == "m4a" and resolve(self.task_info, "m4a_to_mp3"):
+-                # 转 mp3 是重编码，容器随之重写，不必再重封装一次
+-                self.m4a_to_mp3()
+-                return
++            if self.task_info.File.audio_file_ext == "m4a":
++                if resolve(self.task_info, "m4a_to_flac"):
++                    # FLAC 优先：两个选项同时开启时交付无损容器，而不是再压一次 mp3
++                    self.m4a_to_flac()
++                    return
++
++                if resolve(self.task_info, "m4a_to_mp3"):
++                    # 转 mp3 是重编码，容器随之重写，不必再重封装一次
++                    self.m4a_to_mp3()
++                    return
+ 
+             self.remux_audio(on_finished = self.on_convert_completed)
+ 
+@@ -502,6 +508,36 @@
+ 
+         task_manager.update(self.task_info)
+ 
++    def m4a_to_flac(self):
++        """
++        把独立音频流解码后编码成 FLAC 交付
++
++        与 m4a_to_mp3 同构：先写独立的临时名，转换成功后才改扩展名并交付。
++        就地把 audio_file_ext 改成 flac 的话，中途失败或程序退出会让重试走错分支
++        """
++        cwd = self.get_cwd()
++
++        if Path(cwd, self.temp_audio_file_name).exists():
++            self.task_info.Download.status = DownloadStatus.CONVERTING
++            signal_bus.download.update_downloading_item.emit(self.task_info)
++
++            temp_output_audio_file_name = "output_{task_id}.flac".format(task_id = self.task_info.Basic.task_id)
++
++            self._output_audio_file = temp_output_audio_file_name
++            self._converted_audio_file_ext = "flac"
++
++            convert_cmd = FFmpegCommand.convert_m4a_to_flac(
++                input_path = self.temp_audio_file_name,
++                output_path = temp_output_audio_file_name
++            )
++
++            self._start_ffmpeg(convert_cmd, cwd, self.on_convert_completed)
++        else:
++            self.set_error_message(
++                Translator.ERROR_MESSAGES("DOWNLOAD_FAILED"),
++                Translator.ERROR_MESSAGES("M4A_NOT_FOUND")
++            )
++
+     def m4a_to_mp3(self):
+         cwd = self.get_cwd()
+ 
+--- a/gui/component/setting/card.py
++++ b/gui/component/setting/card.py
+@@ -19,7 +19,7 @@
+ from util.thread.pool import GlobalThreadPoolTask
+ from util.common.icon import ExtendedFluentIcon
+ from util.common.io.directory import Directory
+-from util.common.translator import Translator
++from util.common.translator import Translator, localize
+ from util.common.signal_bus import signal_bus
+ 
+ from pathlib import Path
+@@ -692,9 +692,32 @@
+ 
+         self.video_container_choice = SettingComboBox(config.video_container, ["mp4", "mkv"], parent = self)
+         self.m4a_to_mp3_switch = SettingSwitchButton(config.m4a_to_mp3, self)
++        self.m4a_to_flac_switch = SettingSwitchButton(config.m4a_to_flac, self)
+ 
+         self.addGroup(FluentIcon.VIDEO, self.tr("Output Container Format"), self.tr("Choose the container format for the final output video file"), self.video_container_choice)
+         self.addGroup(FluentIcon.MUSIC, self.tr("Convert M4A to MP3"), self.tr("Only applies when downloading audio-only streams. Disabled if video is also selected."), self.m4a_to_mp3_switch)
++        # 新增项：文案不在已编译的 .qm 里，用 localize() 按语言直取。
++        # 说明只留一行短句：这行是小字单行标签，写长了会把右侧开关顶出可视区域；
++        # 详细说明（有损源、体积变大）放到 tooltip 里
++        flac_group = self.addGroup(
++            FluentIcon.MUSIC,
++            localize("将 M4A 转换为 FLAC", "將 M4A 轉換為 FLAC", "Convert M4A to FLAC"),
++            localize(
++                "仅下载纯音频流时生效；与「M4A 转 MP3」同开时以 FLAC 为准。",
++                "僅下載純音訊串流時生效；與「M4A 轉 MP3」同開時以 FLAC 為準。",
++                "Only applies to audio-only streams. Takes precedence over MP3."
++            ),
++            self.m4a_to_flac_switch
++        )
++
++        flac_tip = localize(
++            "源为有损 AAC，转成 FLAC 不会提升音质，且文件体积会明显变大；与「M4A 转 MP3」同时开启时以 FLAC 为准。",
++            "來源為有損 AAC，轉成 FLAC 不會提升音質，且檔案體積會明顯變大；與「M4A 轉 MP3」同時開啟時以 FLAC 為準。",
++            "The source is lossy AAC, so converting to FLAC will not improve quality and the file will be noticeably larger. Takes precedence over MP3 when both are enabled."
++        )
++
++        flac_group.setToolTip(flac_tip)
++        flac_group.contentLabel.setToolTip(flac_tip)
+ 
+ class ParsingSettingCard(ExpandGroupSettingCard):
+     def __init__(self, parent = None):

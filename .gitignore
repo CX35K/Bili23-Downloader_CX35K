@@ -1,0 +1,36 @@
+# ---- 源码/构建产物 ----
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# ---- 二进制/大文件（不进仓库） ----
+*.exe
+*.dll
+*.whl
+*.nupkg
+*.zip
+*.7z
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.bak*
+*.patch.bak
+
+# ---- 本项目的构建/测试产物 ----
+release/
+installer/
+poctest/
+_bugtest/
+sandbox/
+*.result.json
+*_result.json
+*_hang_trace.txt
+close_ask_offsets.json
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
